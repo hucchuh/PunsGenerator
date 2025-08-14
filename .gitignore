@@ -1,0 +1,15 @@
+# Python 缓存文件
+__pycache__/
+*.pyc
+
+# Conda 环境文件夹 (如果它在项目内部)
+pun_env/
+
+# VS Code 配置文件
+.vscode/
+
+# 训练输出和模型文件 (非常重要!)
+output/
+*.pt
+*.bin
+*.safetensors
