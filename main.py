@@ -1,10 +1,7 @@
 # ===================================================================================
 # PunsGenerator - main.py (Final Training Script)
-# Version: 1.0
+# Version: 1.2 - Switched to BF16 for training stability
 # Date: 2025-08-14
-# Description: This script fine-tunes the Qwen1.5-1.8B-Chat model
-#              for generating Chinese puns, using a non-quantized method
-#              for maximum compatibility on platforms like Google Colab.
 # ===================================================================================
 
 import torch
@@ -14,70 +11,53 @@ from peft import LoraConfig
 from trl import SFTTrainer
 import os
 
-# ===================================================================================
-# 1. 配置参数 (Constants and Configuration)
-# ===================================================================================
-
-# 模型ID: 我们选择一个在中文上表现不错，且对硬件要求相对友好的模型。
-# Qwen1.5-1.8B-Chat 是阿里巴巴开源的，性能强劲，且可免费商用。
+# --- (Constants and Configuration) ---
 BASE_MODEL_ID = "Qwen/Qwen1.5-1.8B-Chat"
-
-# 数据集路径: 指向我们精心准备的“教材”
 DATASET_PATH = "data/puns.jsonl"
-
-# 微调后模型的保存路径: 训练完成后，模型的“灵魂”（LoRA适配器）会保存在这里
 OUTPUT_DIR = "output/puns-generator-checkpoint"
-
-
-# ===================================================================================
-# 2. 核心训练函数 (The Main Training Function)
-# ===================================================================================
 
 def train():
     """
-    这个函数封装了整个模型的微调流程。
+    This function encapsulates the entire model fine-tuning workflow.
     """
-    print(">>> 开始执行模型微调流程 (无量化稳定版)...")
-
-    # --- 数据集加载 ---
-    print(f"--> 步骤1: 加载数据集 '{DATASET_PATH}'")
+    print(">>> Starting model fine-tuning (Stable BF16 version)...")
+    
+    # --- Step 1: Load Dataset ---
+    print(f"--> Step 1: Loading dataset '{DATASET_PATH}'")
     dataset = load_dataset("json", data_files=DATASET_PATH, split="train")
 
-    # --- 模型和分词器加载 ---
-    print(f"--> 步骤2: 加载基础模型和分词器 '{BASE_MODEL_ID}'")
-
-    # **关键修正**: 我们不再使用BitsAndBytesConfig进行4-bit量化，
-    # 而是直接以16-bit半精度加载模型，以绕过所有triton/bitsandbytes的兼容性问题。
+    # --- Step 2: Load Base Model and Tokenizer ---
+    print(f"--> Step 2: Loading base model and tokenizer '{BASE_MODEL_ID}'")
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
-        torch_dtype=torch.float16, #直接使用16-bit半精度加载
-        device_map="auto"          #自动将模型分配到可用硬件（如GPU）
+        torch_dtype=torch.float16,
+        device_map="auto"
     )
-    # 禁用模型的缓存功能，这在微调时是推荐的做法
     model.config.use_cache = False 
 
-    # 加载分词器
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
-    # 设置填充Token。对于Qwen模型，我们用eos_token（序列结束符）作为填充符
     tokenizer.pad_token = tokenizer.eos_token
-    # 设置填充符在左边，这对于单批次生成更友好
     tokenizer.padding_side = "left"
 
-    # --- LoRA参数配置 ---
-    print("--> 步骤3: 配置LoRA (参数高效微调)")
+    # --- New Step: Manually Format Dataset ---
+    print("--> New Step: Manually formatting dataset")
+    def format_dataset(example):
+        return {"text": tokenizer.apply_chat_template(example["messages"], tokenize=False)}
+    formatted_dataset = dataset.map(format_dataset)
+
+    # --- Step 3: Configure LoRA ---
+    print("--> Step 3: Configuring LoRA for PEFT")
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
-        # **关键修正**: 明确告诉PEFT要修改模型的哪些部分。
-        # 对于Qwen1.5系列模型，这些是标准的目标模块。
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM"
     )
 
-    # --- 训练参数配置 ---
-    print("--> 步骤4: 配置训练参数")
+    # --- Step 4: Configure Training Arguments ---
+    print("--> Step 4: Configuring Training Arguments")
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=4,
@@ -86,37 +66,31 @@ def train():
         max_steps=150,
         logging_steps=10,
         save_steps=50,
-        fp16=True, # 启用半精度训练
+        bf16=True, # **CRITICAL FIX**: Use BF16 for stability on modern GPUs like T4.
         push_to_hub=False,
         report_to="none",
     )
 
-    # --- 初始化并启动训练器 ---
-    print("--> 步骤5: 初始化SFTTrainer并开始训练")
+    # --- Step 5: Initialize and Start SFTTrainer ---
+    print("--> Step 5: Initializing SFTTrainer and starting training")
     trainer = SFTTrainer(
         model=model,
-        train_dataset=dataset,
+        train_dataset=formatted_dataset,
         peft_config=lora_config,
-        dataset_text_field="messages", # **重要**: 告诉Trainer我们的数据在'messages'字段里
+        dataset_text_field="text",
         args=training_args,
         tokenizer=tokenizer,
         max_seq_length=1024,
-        packing=True, # “打包”技术，将多个短序列合并成一个长序列，提升训练效率
+        packing=True,
     )
 
-    # 开始训练
     trainer.train()
-
-    # --- 保存最终的模型 ---
-    print(f"--> 步骤6: 训练完成，保存最终模型到 '{OUTPUT_DIR}'")
+    
+    # --- Step 6: Save Final Model ---
+    print(f"--> Step 6: Training complete. Saving final model to '{OUTPUT_DIR}'")
     trainer.save_model(OUTPUT_DIR)
     
-    print(">>> 模型微调流程圆满结束！")
+    print(">>> Model fine-tuning workflow has finished successfully!")
 
-
-# ===================================================================================
-# 3. 脚本执行入口 (Script Entry Point)
-# ===================================================================================
 if __name__ == "__main__":
-    # 当我们直接运行 `python main.py` 时，这个部分的代码会被执行
     train()
